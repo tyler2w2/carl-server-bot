@@ -15,20 +15,20 @@ TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 # Only this role can use /rules
 RULES_ROLE_ID = int(os.getenv("RULES_ROLE_ID", "1467182548894351505"))
 
-# Users get this role when they react to the rules message
+# Role users get from reacting to the rules message
 VERIFY_ROLE_ID = int(os.getenv("VERIFY_ROLE_ID", "1491590761689649282"))
 VERIFY_EMOJI = "👍"
 
-# Mentioned user in rule 5
+# Mentioned user in the rules text
 STREAMER_USER_ID = int(os.getenv("STREAMER_USER_ID", "831542616188256347"))
 
 # Channel where the bot posts the rules embed on startup
 RULES_CHANNEL_ID = int(os.getenv("RULES_CHANNEL_ID", "0"))
 
-# Optional: existing rules message ID so the bot reuses that message after restart
+# Optional: existing rules message ID to reuse after restart
 RULES_MESSAGE_ID = int(os.getenv("RULES_MESSAGE_ID", "0"))
 
-# Optional: put your server ID here for faster slash command sync
+# Optional: faster slash-command sync for one server
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
 # Timeout durations
@@ -41,22 +41,25 @@ SPAM_REPEAT_COUNT = 5
 MOD_BEG_WINDOW_SECONDS = 600  # 10 minutes
 MOD_BEG_REPEAT_COUNT = 2
 
-# Fairly strict banned terms
-TOS_TERMS = {
-    "tos",
-}
+# =========================
+# MODERATION SETTINGS
+# =========================
 
+# User specifically wants "tos" to trigger moderation
+TOS_TERMS = {"tos"}
+
+# Keep this focused on major stuff only
 HATE_SPEECH_TERMS = {
     "faggot",
     "nigger",
     "nigga",
-    "retard",
     "kike",
     "spic",
     "chink",
     "tranny",
 }
 
+# Asking for mod
 MOD_BEG_PATTERNS = [
     re.compile(r"\bmake me mod\b", re.IGNORECASE),
     re.compile(r"\bgive me mod\b", re.IGNORECASE),
@@ -66,17 +69,23 @@ MOD_BEG_PATTERNS = [
     re.compile(r"\bcan i be mod\b", re.IGNORECASE),
 ]
 
-ARGUMENT_PATTERNS = [
-    re.compile(r"\bfuck you\b", re.IGNORECASE),
-    re.compile(r"\bstfu\b", re.IGNORECASE),
-    re.compile(r"\bshut up\b", re.IGNORECASE),
-    re.compile(r"\byou are dumb\b", re.IGNORECASE),
-    re.compile(r"\byoure dumb\b", re.IGNORECASE),
+# Major threat / self-harm harassment phrases only
+SEVERE_THREAT_PATTERNS = [
     re.compile(r"\bkill yourself\b", re.IGNORECASE),
     re.compile(r"\bkys\b", re.IGNORECASE),
+    re.compile(r"\bhang yourself\b", re.IGNORECASE),
+    re.compile(r"\bgo die\b", re.IGNORECASE),
+    re.compile(r"\bi will kill you\b", re.IGNORECASE),
+    re.compile(r"\bi'm going to kill you\b", re.IGNORECASE),
+    re.compile(r"\bim going to kill you\b", re.IGNORECASE),
+    re.compile(r"\bi will find you\b", re.IGNORECASE),
+    re.compile(r"\bi'm going to find you\b", re.IGNORECASE),
+    re.compile(r"\bim going to find you\b", re.IGNORECASE),
 ]
 
-# In-memory tracking
+# =========================
+# IN-MEMORY TRACKING
+# =========================
 recent_messages = defaultdict(deque)
 recent_mod_begs = defaultdict(deque)
 recent_word_usage = defaultdict(lambda: defaultdict(deque))
@@ -106,7 +115,6 @@ class SullyGangBot(commands.Bot):
 
 
 bot = SullyGangBot()
-
 
 # =========================
 # HELPERS
@@ -166,10 +174,10 @@ def build_rules_embed(guild: discord.Guild | None) -> discord.Embed:
         "**2.** Do not use the stream ideas channel for anything other than stream ideas.\n"
         "**3.** Do not ask for mod. You will be auto timed out.\n"
         "**4.** Do not spam the same message 5 times. You will be timed out.\n"
-        f"**5.** No arguing. This is a community and we are all here for the love of {streamer_mention} and his dumb streams, so just be friendly.\n"
-        "**6.** Respect everyone fairly and equally.\n"
-        "**7.** No form of hate speech, tos, or slurs will be tolerated. You will be instantly timed out for a week.\n"
-        "**8.** There is no making fun of or threatening people in any of the chats. Just be friends, guys. If you do not like each other, do not start problems."
+        "**5.** Arguing will be dealt with manually. Keep it friendly.\n"
+        f"**6.** Respect everyone fairly and equally. We are all here for the love of {streamer_mention} and his dumb streams.\n"
+        "**7.** No hate speech, slurs, or severe phrases like kys. That is an instant one week timeout.\n"
+        "**8.** No serious threats toward people in chat."
     )
 
     embed = discord.Embed(
@@ -298,29 +306,38 @@ async def handle_mod_begging(message: discord.Message) -> bool:
 async def handle_severe_content(message: discord.Message) -> bool:
     text = message.content
 
-    if contains_banned_terms(text, TOS_TERMS) or contains_banned_terms(text, HATE_SPEECH_TERMS):
+    if contains_banned_terms(text, TOS_TERMS):
+        await safe_delete(message)
+        await timeout_member(
+            message.author,
+            ONE_DAY,
+            "Used tos",
+        )
+        return True
+
+    if contains_banned_terms(text, HATE_SPEECH_TERMS):
         await safe_delete(message)
         await timeout_member(
             message.author,
             ONE_WEEK,
-            "Used prohibited language (TOS / slurs / hate speech)",
+            "Used slurs / hate speech",
         )
         return True
 
     return False
 
 
-async def handle_arguments_and_threats(message: discord.Message) -> bool:
-    if matches_any_pattern(message.content, ARGUMENT_PATTERNS):
+async def handle_severe_threats(message: discord.Message) -> bool:
+    if matches_any_pattern(message.content, SEVERE_THREAT_PATTERNS):
+        await safe_delete(message)
         await timeout_member(
             message.author,
-            ONE_DAY,
-            "Threats / hostile arguing / harassment",
+            ONE_WEEK,
+            "Severe threats / hate speech",
         )
         return True
 
     return False
-
 
 # =========================
 # EVENTS
@@ -336,9 +353,14 @@ async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
 
+    # Only major stuff first
     if await handle_severe_content(message):
         return
 
+    if await handle_severe_threats(message):
+        return
+
+    # Spam + mod begging
     if await handle_mod_begging(message):
         return
 
@@ -348,9 +370,7 @@ async def on_message(message: discord.Message):
     if await handle_word_spam(message):
         return
 
-    if await handle_arguments_and_threats(message):
-        return
-
+    # Arguing is manual, so no auto-timeout for that
     await bot.process_commands(message)
 
 
@@ -435,7 +455,6 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
     except discord.HTTPException as exc:
         print(f"Failed to remove verification role: {exc}")
 
-
 # =========================
 # SLASH COMMANDS
 # =========================
@@ -474,7 +493,6 @@ async def rules_command_error(interaction: discord.Interaction, error: app_comma
             await interaction.response.send_message(f"Error: {error}", ephemeral=True)
     except Exception:
         print(f"Slash command error: {error}")
-
 
 # =========================
 # ENTRY POINT
