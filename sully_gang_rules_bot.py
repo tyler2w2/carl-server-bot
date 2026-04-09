@@ -16,7 +16,7 @@ TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 RULES_ROLE_ID = int(os.getenv("RULES_ROLE_ID", "1467182548894351505"))
 
 # Role users receive after reacting to the bot's verification message
-VERIFY_ROLE_ID = int(os.getenv("VERIFY_ROLE_ID", "1467172248879235215"))
+VERIFY_ROLE_ID = int(os.getenv("VERIFY_ROLE_ID", "1491590761689649282"))
 VERIFY_EMOJI = "👍"
 
 # Channel that is ONLY for stream ideas
@@ -259,8 +259,8 @@ async def handle_mod_begging(message: discord.Message) -> bool:
 
 
 async def handle_stream_ideas_channel_rule(message: discord.Message) -> bool:
-    if message.channel.id != STREAM_IDEAS_CHANNEL_ID:
-        return False
+    # Disabled moderation for this channel as requested
+    return False
 
     # Any message not clearly a stream idea gets timed out.
     # This includes replies in that channel.
@@ -463,6 +463,8 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
 # =========================
 @bot.tree.command(name="rules", description="Send the Sully Gang rules embed")
 async def rules_command(interaction: discord.Interaction):
+    global reaction_role_message_id
+
     member = interaction.user
 
     if not isinstance(member, discord.Member):
@@ -479,7 +481,13 @@ async def rules_command(interaction: discord.Interaction):
 
     embed = build_rules_embed(interaction.guild)
     await interaction.response.send_message("Rules embed sent.", ephemeral=True)
-    await interaction.channel.send(embed=embed)
+    sent = await interaction.channel.send(embed=embed)
+
+    try:
+        await sent.add_reaction(VERIFY_EMOJI)
+        reaction_role_message_id = sent.id
+    except discord.HTTPException:
+        pass
 
 
 # Optional: better slash-command permission display in Discord clients
