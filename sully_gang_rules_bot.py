@@ -12,23 +12,26 @@ from discord.ext import commands
 # =========================
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
-# Only this role can use /rules
+# Role allowed to use /rules
 RULES_ROLE_ID = int(os.getenv("RULES_ROLE_ID", "1467182548894351505"))
 
-# Role users get from reacting to the rules message
+# Role users receive after reacting to the bot's verification message
 VERIFY_ROLE_ID = int(os.getenv("VERIFY_ROLE_ID", "1491590761689649282"))
 VERIFY_EMOJI = "👍"
 
-# Mentioned user in the rules text
+# Channel that is ONLY for stream ideas
+STREAM_IDEAS_CHANNEL_ID = int(os.getenv("STREAM_IDEAS_CHANNEL_ID", "1483866348131188757"))
+
+# Mentioned user in rule 5
 STREAMER_USER_ID = int(os.getenv("STREAMER_USER_ID", "831542616188256347"))
 
-# Channel where the bot posts the rules embed on startup
-RULES_CHANNEL_ID = int(os.getenv("RULES_CHANNEL_ID", "0"))
+# Channel where the bot posts the reaction-role message on startup.
+REACTION_ROLE_CHANNEL_ID = int(os.getenv("REACTION_ROLE_CHANNEL_ID", "0"))
 
-# Optional: existing rules message ID to reuse after restart
-RULES_MESSAGE_ID = int(os.getenv("RULES_MESSAGE_ID", "0"))
+# Optional: if you already have a reaction-role message, put its ID here.
+REACTION_ROLE_MESSAGE_ID = int(os.getenv("REACTION_ROLE_MESSAGE_ID", "0"))
 
-# Optional: faster slash-command sync for one server
+# Optional: put your server ID here for faster slash-command sync.
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
 # Timeout durations
@@ -41,25 +44,22 @@ SPAM_REPEAT_COUNT = 5
 MOD_BEG_WINDOW_SECONDS = 600  # 10 minutes
 MOD_BEG_REPEAT_COUNT = 2
 
-# =========================
-# MODERATION SETTINGS
-# =========================
+# "Fairly strict" keyword sets. Adjust these to fit your server.
+# 'tos' by itself does not trigger moderation
+TOS_TERMS = set()
 
-# User specifically wants "tos" to trigger moderation
-TOS_TERMS = {"tos"}
-
-# Keep this focused on major stuff only
+# Keep this reasonably small so it is not too strict.
 HATE_SPEECH_TERMS = {
     "faggot",
     "nigger",
     "nigga",
+    "retard",
     "kike",
     "spic",
     "chink",
     "tranny",
 }
 
-# Asking for mod
 MOD_BEG_PATTERNS = [
     re.compile(r"\bmake me mod\b", re.IGNORECASE),
     re.compile(r"\bgive me mod\b", re.IGNORECASE),
@@ -69,27 +69,21 @@ MOD_BEG_PATTERNS = [
     re.compile(r"\bcan i be mod\b", re.IGNORECASE),
 ]
 
-# Major threat / self-harm harassment phrases only
 SEVERE_THREAT_PATTERNS = [
-    re.compile(r"\bkill yourself\b", re.IGNORECASE),
-    re.compile(r"\bkys\b", re.IGNORECASE),
-    re.compile(r"\bhang yourself\b", re.IGNORECASE),
-    re.compile(r"\bgo die\b", re.IGNORECASE),
-    re.compile(r"\bi will kill you\b", re.IGNORECASE),
-    re.compile(r"\bi'm going to kill you\b", re.IGNORECASE),
-    re.compile(r"\bim going to kill you\b", re.IGNORECASE),
-    re.compile(r"\bi will find you\b", re.IGNORECASE),
-    re.compile(r"\bi'm going to find you\b", re.IGNORECASE),
-    re.compile(r"\bim going to find you\b", re.IGNORECASE),
+    re.compile(r"kill yourself", re.IGNORECASE),
+    re.compile(r"kys", re.IGNORECASE),
+    re.compile(r"i will kill you", re.IGNORECASE),
+    re.compile(r"i'm going to kill you", re.IGNORECASE),
+    re.compile(r"im going to kill you", re.IGNORECASE),
+    re.compile(r"i will find you", re.IGNORECASE),
 ]
 
-# =========================
-# IN-MEMORY TRACKING
-# =========================
+# In-memory tracking
 recent_messages = defaultdict(deque)
 recent_mod_begs = defaultdict(deque)
 recent_word_usage = defaultdict(lambda: defaultdict(deque))
-rules_message_id = RULES_MESSAGE_ID
+reaction_role_message_id = REACTION_ROLE_MESSAGE_ID
+
 
 # =========================
 # BOT SETUP
@@ -115,6 +109,7 @@ class SullyGangBot(commands.Bot):
 
 
 bot = SullyGangBot()
+
 
 # =========================
 # HELPERS
@@ -160,97 +155,63 @@ async def safe_delete(message: discord.Message):
         pass
 
 
-def build_rules_embed(guild: discord.Guild | None) -> discord.Embed:
-    streamer_mention = f"<@{STREAMER_USER_ID}>"
-    verify_role_mention = f"<@&{VERIFY_ROLE_ID}>"
+async def send_reaction_role_message():
+    global reaction_role_message_id
 
-    description = (
-        f"React with {VERIFY_EMOJI} on this message to get {verify_role_mention}.\n\n"
-        "Please read and follow the rules below."
-    )
+    if not REACTION_ROLE_CHANNEL_ID:
+        return
 
-    rules_text = (
-        "**1.** You cannot at any circumstance say **tos** in any chat.\n"
-        "**2.** Do not use the stream ideas channel for anything other than stream ideas.\n"
-        "**3.** Do not ask for mod. You will be auto timed out.\n"
-        "**4.** Do not spam the same message 5 times. You will be timed out.\n"
-        "**5.** Arguing will be dealt with manually. Keep it friendly.\n"
-        f"**6.** Respect everyone fairly and equally. We are all here for the love of {streamer_mention} and his dumb streams.\n"
-        "**7.** No hate speech, slurs, or severe phrases like kys. That is an instant one week timeout.\n"
-        "**8.** No serious threats toward people in chat."
-    )
+    channel = bot.get_channel(REACTION_ROLE_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(REACTION_ROLE_CHANNEL_ID)
+        except Exception:
+            return
 
     embed = discord.Embed(
-        title="Sully Gang Rules",
-        description=description,
+        title="Sully Gang Access",
+        description=(
+            f"React with {VERIFY_EMOJI} below to get access to the server role.\n\n"
+            "By reacting, you confirm that you agree to follow the server rules."
+        ),
         color=discord.Color.gold(),
         timestamp=datetime.now(timezone.utc),
     )
-    embed.add_field(name="Rules", value=rules_text, inline=False)
     embed.set_footer(text="Sully Gang")
 
-    if guild and guild.icon:
-        embed.set_thumbnail(url=guild.icon.url)
-
-    return embed
-
-
-async def send_or_attach_rules_message():
-    global rules_message_id
-
-    if not RULES_CHANNEL_ID:
-        return
-
-    channel = bot.get_channel(RULES_CHANNEL_ID)
-    if channel is None:
+    if reaction_role_message_id:
         try:
-            channel = await bot.fetch_channel(RULES_CHANNEL_ID)
-        except Exception as exc:
-            print(f"Could not fetch rules channel: {exc}")
-            return
-
-    if rules_message_id:
-        try:
-            existing = await channel.fetch_message(rules_message_id)
+            existing = await channel.fetch_message(reaction_role_message_id)
             try:
                 await existing.add_reaction(VERIFY_EMOJI)
-            except discord.HTTPException as exc:
-                print(f"Could not add reaction to existing rules message: {exc}")
+            except discord.HTTPException:
+                pass
             return
         except Exception:
-            rules_message_id = 0
-
-    embed = build_rules_embed(getattr(channel, "guild", None))
+            reaction_role_message_id = 0
 
     try:
         sent = await channel.send(embed=embed)
         await sent.add_reaction(VERIFY_EMOJI)
-        rules_message_id = sent.id
-        print(f"Rules message created: {rules_message_id}")
+        reaction_role_message_id = sent.id
+        print(f"Reaction-role message created: {reaction_role_message_id}")
     except Exception as exc:
-        print(f"Failed to send rules message: {exc}")
+        print(f"Failed to send reaction-role message: {exc}")
 
 
 async def handle_exact_spam(message: discord.Message) -> bool:
     now = discord.utils.utcnow()
+    user_queue = recent_messages[message.author.id]
     normalized = normalize_text(message.content)
 
-    if not normalized:
-        return False
-
-    user_queue = recent_messages[message.author.id]
     user_queue.append((normalized, now))
 
     while user_queue and (now - user_queue[0][1]).total_seconds() > SPAM_WINDOW_SECONDS:
         user_queue.popleft()
 
-    same_count = sum(1 for content, _ in user_queue if content == normalized)
+    same_count = sum(1 for content, _ in user_queue if content == normalized and content)
     if same_count >= SPAM_REPEAT_COUNT:
-        await timeout_member(
-            message.author,
-            ONE_DAY,
-            "Spam: repeated same message 5 times in 10 seconds",
-        )
+        await timeout_member(message.author, ONE_DAY, "Spam: repeated same message 5 times in 10 seconds")
         return True
 
     return False
@@ -271,11 +232,7 @@ async def handle_word_spam(message: discord.Message) -> bool:
             dq.popleft()
 
         if len(dq) >= SPAM_REPEAT_COUNT:
-            await timeout_member(
-                message.author,
-                ONE_DAY,
-                f"Spam: repeated word '{token}' 5 times in 10 seconds",
-            )
+            await timeout_member(message.author, ONE_DAY, f"Spam: repeated word '{token}' 5 times in 10 seconds")
             return True
 
     return False
@@ -293,11 +250,40 @@ async def handle_mod_begging(message: discord.Message) -> bool:
         dq.popleft()
 
     if len(dq) >= MOD_BEG_REPEAT_COUNT:
-        await timeout_member(
-            message.author,
-            ONE_DAY,
-            "Asked for mod twice within 10 minutes",
-        )
+        await timeout_member(message.author, ONE_DAY, "Asked for mod twice within 10 minutes")
+        return True
+
+    return False
+
+
+async def handle_stream_ideas_channel_rule(message: discord.Message) -> bool:
+    # Disabled moderation for this channel as requested
+    return False
+
+    # Any message not clearly a stream idea gets timed out.
+    # This includes replies in that channel.
+    if message.reference is not None:
+        await timeout_member(message.author, ONE_DAY, "Replying in the stream ideas channel is not allowed")
+        return True
+
+    text = normalize_text(message.content)
+    if not text:
+        await timeout_member(message.author, ONE_DAY, "Only stream ideas are allowed in the stream ideas channel")
+        return True
+
+    idea_markers = [
+        "stream idea",
+        "you should stream",
+        "stream",
+        "play",
+        "react to",
+        "do a stream",
+        "idea:",
+        "you should do",
+    ]
+
+    if not any(marker in text for marker in idea_markers):
+        await timeout_member(message.author, ONE_DAY, "Only stream ideas are allowed in the stream ideas channel")
         return True
 
     return False
@@ -306,38 +292,59 @@ async def handle_mod_begging(message: discord.Message) -> bool:
 async def handle_severe_content(message: discord.Message) -> bool:
     text = message.content
 
-    if contains_banned_terms(text, TOS_TERMS):
-        await safe_delete(message)
-        await timeout_member(
-            message.author,
-            ONE_DAY,
-            "Used tos",
-        )
-        return True
-
     if contains_banned_terms(text, HATE_SPEECH_TERMS):
         await safe_delete(message)
-        await timeout_member(
-            message.author,
-            ONE_WEEK,
-            "Used slurs / hate speech",
-        )
+        await timeout_member(message.author, ONE_WEEK, "Used slurs / hate speech")
         return True
 
     return False
 
 
-async def handle_severe_threats(message: discord.Message) -> bool:
+async def handle_arguments_and_threats(message: discord.Message) -> bool:
     if matches_any_pattern(message.content, SEVERE_THREAT_PATTERNS):
-        await safe_delete(message)
-        await timeout_member(
-            message.author,
-            ONE_WEEK,
-            "Severe threats / hate speech",
-        )
+        await timeout_member(message.author, ONE_DAY, "Severe threats / harassment")
         return True
 
     return False
+
+
+def build_rules_embed(guild: discord.Guild | None) -> discord.Embed:
+    streamer_mention = f"<@{STREAMER_USER_ID}>"
+    stream_ideas_channel = f"<#{STREAM_IDEAS_CHANNEL_ID}>"
+    verify_role_mention = f"<@&{VERIFY_ROLE_ID}>"
+
+    description = (
+        f"React with {VERIFY_EMOJI} on the verification message to get {verify_role_mention}.\n\n"
+        "Please read and follow the rules below."
+    )
+
+    rules_text = (
+        "**1.** Do not spam or start problems in chat.
+"
+        f"**2.** Do not use {stream_ideas_channel} for anything other than stream ideas. If you even reply to a message in there, you will be timed out. It is specifically for stream ideas, and mods are tired of having to clear up chats from people just yapping.\n"
+        "**3.** Do not ask for mod. You will be auto timed out.\n"
+        "**4.** Do not spam the same message 5 times. You will be timed out.\n"
+        f"**5.** No arguing. This is a community and we are all here for the love of {streamer_mention} and his dumb streams, so just be friendly.\n"
+        "**6.** Respect everyone fairly and equally.\n"
+        "**7.** No hate speech, slurs, or severe phrases like kys. That is an instant one week timeout.
+"
+        "**8.** There is no making fun of or threatening people in any of the chats. Just be friends, guys. If you do not like each other, do not start problems."
+    )
+
+    embed = discord.Embed(
+        title="Sully Gang Rules",
+        description=description,
+        color=discord.Color.gold(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Rules", value=rules_text, inline=False)
+    embed.set_footer(text="Sully Gang")
+
+    if guild and guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+
+    return embed
+
 
 # =========================
 # EVENTS
@@ -345,7 +352,7 @@ async def handle_severe_threats(message: discord.Message) -> bool:
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    await send_or_attach_rules_message()
+    await send_reaction_role_message()
 
 
 @bot.event
@@ -353,38 +360,39 @@ async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
 
-    # Only major stuff first
+    # Rule 7 first: delete severe content and timeout for a week.
     if await handle_severe_content(message):
         return
 
-    if await handle_severe_threats(message):
+    # Rule 2: stream ideas channel enforcement.
+    if await handle_stream_ideas_channel_rule(message):
         return
 
-    # Spam + mod begging
+    # Rule 3: asking for mod.
     if await handle_mod_begging(message):
         return
 
+    # Rule 4: same message spam.
     if await handle_exact_spam(message):
         return
 
+    # Extra: same word 5 times in 10 seconds.
     if await handle_word_spam(message):
         return
 
-    # Arguing is manual, so no auto-timeout for that
+    # Rules 5 and 8: arguing / threats / harassment.
+    if await handle_arguments_and_threats(message):
+        return
+
     await bot.process_commands(message)
 
 
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
-    global rules_message_id
-
     if payload.user_id == bot.user.id:
         return
 
-    if payload.guild_id is None:
-        return
-
-    if not rules_message_id or payload.message_id != rules_message_id:
+    if not reaction_role_message_id or payload.message_id != reaction_role_message_id:
         return
 
     if str(payload.emoji) != VERIFY_EMOJI:
@@ -406,25 +414,19 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
 
     role = guild.get_role(VERIFY_ROLE_ID)
     if role is None:
-        print("Verify role not found.")
         return
 
     try:
-        await member.add_roles(role, reason="Rules reaction verification")
+        await member.add_roles(role, reason="Reaction role verification")
     except discord.Forbidden:
         print("Missing permission to assign verification role.")
-    except discord.HTTPException as exc:
-        print(f"Failed to assign verification role: {exc}")
+    except discord.HTTPException:
+        pass
 
 
 @bot.event
 async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
-    global rules_message_id
-
-    if payload.guild_id is None:
-        return
-
-    if not rules_message_id or payload.message_id != rules_message_id:
+    if not reaction_role_message_id or payload.message_id != reaction_role_message_id:
         return
 
     if str(payload.emoji) != VERIFY_EMOJI:
@@ -449,50 +451,53 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
         return
 
     try:
-        await member.remove_roles(role, reason="Rules reaction removed")
+        await member.remove_roles(role, reason="Reaction role removed")
     except discord.Forbidden:
         print("Missing permission to remove verification role.")
-    except discord.HTTPException as exc:
-        print(f"Failed to remove verification role: {exc}")
+    except discord.HTTPException:
+        pass
+
 
 # =========================
 # SLASH COMMANDS
 # =========================
 @bot.tree.command(name="rules", description="Send the Sully Gang rules embed")
 async def rules_command(interaction: discord.Interaction):
-    global rules_message_id
-
-    await interaction.response.defer(ephemeral=True)
+    global reaction_role_message_id
 
     member = interaction.user
 
     if not isinstance(member, discord.Member):
-        await interaction.followup.send("This command can only be used in a server.", ephemeral=True)
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
         return
 
-    if not any(role.id == RULES_ROLE_ID for role in member.roles):
-        await interaction.followup.send("You do not have permission to use this command.", ephemeral=True)
+    allowed = any(role.id == RULES_ROLE_ID for role in member.roles)
+    if not allowed:
+        await interaction.response.send_message(
+            "You do not have permission to use this command.",
+            ephemeral=True,
+        )
         return
+
+    embed = build_rules_embed(interaction.guild)
+    await interaction.response.send_message("Rules embed sent.", ephemeral=True)
+    sent = await interaction.channel.send(embed=embed)
 
     try:
-        embed = build_rules_embed(interaction.guild)
-        sent = await interaction.channel.send(embed=embed)
         await sent.add_reaction(VERIFY_EMOJI)
-        rules_message_id = sent.id
-        await interaction.followup.send("Rules sent.", ephemeral=True)
-    except Exception as exc:
-        await interaction.followup.send(f"Failed to send rules: {exc}", ephemeral=True)
+        reaction_role_message_id = sent.id
+    except discord.HTTPException:
+        pass
 
 
+# Optional: better slash-command permission display in Discord clients
 @rules_command.error
 async def rules_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    try:
-        if interaction.response.is_done():
-            await interaction.followup.send(f"Error: {error}", ephemeral=True)
-        else:
-            await interaction.response.send_message(f"Error: {error}", ephemeral=True)
-    except Exception:
-        print(f"Slash command error: {error}")
+    if interaction.response.is_done():
+        await interaction.followup.send(f"Error: {error}", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"Error: {error}", ephemeral=True)
+
 
 # =========================
 # ENTRY POINT
