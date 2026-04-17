@@ -2,6 +2,8 @@ import os
 import re
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
+from typing import Iterable
 
 import discord
 from discord import app_commands
@@ -25,6 +27,9 @@ STREAMER_USER_ID = int(os.getenv("STREAMER_USER_ID", "831542616188256347"))
 # Channel where the bot posts the rules embed on startup
 RULES_CHANNEL_ID = int(os.getenv("RULES_CHANNEL_ID", "0"))
 
+# Channel where moderation logs are sent
+MOD_LOG_CHANNEL_ID = int(os.getenv("MOD_LOG_CHANNEL_ID", "1494837485984022658"))
+
 # Optional: existing rules message ID to reuse after restart
 RULES_MESSAGE_ID = int(os.getenv("RULES_MESSAGE_ID", "0"))
 
@@ -32,21 +37,32 @@ RULES_MESSAGE_ID = int(os.getenv("RULES_MESSAGE_ID", "0"))
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
 # Timeout durations
+ONE_HOUR = timedelta(hours=1)
 ONE_DAY = timedelta(days=1)
 ONE_WEEK = timedelta(weeks=1)
 
 # Detection windows
 SPAM_WINDOW_SECONDS = 10
 SPAM_REPEAT_COUNT = 5
+SPAM_FLOOD_WINDOW_SECONDS = 8
+SPAM_FLOOD_COUNT = 5
 MOD_BEG_WINDOW_SECONDS = 600
 MOD_BEG_REPEAT_COUNT = 2
+MAX_LOG_CONTENT_LENGTH = 1000
 
 # =========================
 # MODERATION SETTINGS
 # =========================
 
-# 'tos' does not trigger moderation
-TOS_TERMS = set()
+def parse_env_terms(name: str) -> set[str]:
+    raw = os.getenv(name, "")
+    if not raw.strip():
+        return set()
+    return {term.strip().lower() for term in raw.split(",") if term.strip()}
+
+
+# Optional extra TOS terms from env, comma-separated
+TOS_TERMS = parse_env_terms("TOS_TERMS")
 
 # Major-only slurs / hate speech
 HATE_SPEECH_TERMS = {
@@ -83,11 +99,18 @@ SEVERE_THREAT_PATTERNS = [
     re.compile(r"\bim going to find you\b", re.IGNORECASE),
 ]
 
+COMMON_CHAT_WORDS = {
+    "a", "and", "are", "bro", "but", "for", "hello", "hey", "hi", "i", "im", "is",
+    "it", "lol", "lmao", "me", "my", "need", "no", "not", "please", "the", "to",
+    "u", "ur", "want", "we", "wish", "ya", "yo", "you"
+}
+
 # =========================
 # IN-MEMORY TRACKING
 # =========================
 recent_messages = defaultdict(deque)
 recent_mod_begs = defaultdict(deque)
+recent_activity = defaultdict(deque)
 rules_message_id = RULES_MESSAGE_ID
 
 # =========================
@@ -125,7 +148,7 @@ def normalize_text(text: str) -> str:
     return text
 
 
-def contains_banned_terms(text: str, terms: set[str]) -> bool:
+def contains_banned_terms(text: str, terms: Iterable[str]) -> bool:
     lowered = text.lower()
     for term in terms:
         if re.search(rf"\b{re.escape(term)}\b", lowered):
@@ -137,23 +160,175 @@ def matches_any_pattern(text: str, patterns: list[re.Pattern]) -> bool:
     return any(pattern.search(text) for pattern in patterns)
 
 
-async def timeout_member(member: discord.Member, duration: timedelta, reason: str):
+def truncate_text(text: str, limit: int = MAX_LOG_CONTENT_LENGTH) -> str:
+    if not text:
+        return "(no text)"
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def tokenize(text: str) -> list[str]:
+    return re.findall(r"[a-zA-Z']+", text.lower())
+
+
+def looks_like_gibberish(text: str) -> bool:
+    normalized = normalize_text(text)
+    if not normalized:
+        return False
+
+    letters_only = re.sub(r"[^a-z]", "", normalized)
+    if len(letters_only) < 6:
+        return False
+
+    tokens = tokenize(normalized)
+    long_tokens = [tok for tok in tokens if len(tok) >= 4]
+    if not long_tokens:
+        return False
+
+    known_words = sum(1 for tok in tokens if tok in COMMON_CHAT_WORDS)
+    vowel_ratio = sum(1 for ch in letters_only if ch in "aeiou") / max(len(letters_only), 1)
+    consonant_runs = re.findall(r"[bcdfghjklmnpqrstvwxyz]{5,}", letters_only)
+    weird_chars = re.findall(r"[^\w\s]", text)
+
+    if known_words >= 2:
+        return False
+
+    if consonant_runs:
+        return True
+
+    if vowel_ratio < 0.22 and len(letters_only) >= 8:
+        return True
+
+    if len(weird_chars) >= 2 and known_words == 0 and len(letters_only) >= 8:
+        return True
+
+    if len(long_tokens) >= 1 and all(tok not in COMMON_CHAT_WORDS for tok in long_tokens) and len(tokens) <= 3:
+        unique_chars = len(set(letters_only)) / max(len(letters_only), 1)
+        if unique_chars > 0.55 and vowel_ratio < 0.3:
+            return True
+
+    return False
+
+
+async def get_mod_log_channel(guild: discord.Guild | None):
+    if guild is None or not MOD_LOG_CHANNEL_ID:
+        return None
+
+    channel = guild.get_channel(MOD_LOG_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(MOD_LOG_CHANNEL_ID)
+        except Exception as exc:
+            print(f"Could not fetch mod log channel: {exc}")
+            return None
+    return channel
+
+
+async def build_image_files(message: discord.Message) -> list[discord.File]:
+    files: list[discord.File] = []
+
+    for index, attachment in enumerate(message.attachments[:3], start=1):
+        content_type = (attachment.content_type or "").lower()
+        filename = (attachment.filename or f"attachment_{index}").lower()
+        is_image = content_type.startswith("image/") or filename.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif"))
+        if not is_image:
+            continue
+
+        try:
+            data = await attachment.read(use_cached=True)
+        except Exception as exc:
+            print(f"Failed to read attachment for logging: {exc}")
+            continue
+
+        files.append(discord.File(BytesIO(data), filename=attachment.filename or f"evidence_{index}"))
+
+    return files
+
+
+async def log_moderation_action(
+    *,
+    message: discord.Message,
+    reason: str,
+    duration: timedelta,
+    deleted: bool = False,
+):
+    channel = await get_mod_log_channel(message.guild)
+    if channel is None:
+        return
+
+    embed = discord.Embed(
+        title="Moderation Log",
+        color=discord.Color.red(),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="User", value=f"{message.author.mention} (`{message.author.id}`)", inline=False)
+    embed.add_field(name="Reason", value=reason, inline=False)
+    embed.add_field(name="Timeout Length", value=str(duration), inline=True)
+    embed.add_field(name="Deleted Message", value="Yes" if deleted else "No", inline=True)
+    embed.add_field(name="Channel", value=message.channel.mention, inline=True)
+    embed.add_field(name="When", value=f"<t:{int(discord.utils.utcnow().timestamp())}:F>", inline=False)
+    embed.add_field(name="Message Content", value=truncate_text(message.content), inline=False)
+
+    if message.attachments:
+        attachment_lines = [attachment.url for attachment in message.attachments[:5]]
+        embed.add_field(name="Attachments", value="\n".join(attachment_lines), inline=False)
+
+    jump_url = getattr(message, "jump_url", None)
+    if jump_url:
+        embed.add_field(name="Message Link", value=jump_url, inline=False)
+
+    files = await build_image_files(message)
+    if files:
+        embed.set_image(url=f"attachment://{files[0].filename}")
+
+    try:
+        await channel.send(embed=embed, files=files)
+    except discord.Forbidden:
+        print("Missing permission to send moderation logs.")
+    except discord.HTTPException as exc:
+        print(f"Failed to send moderation log: {exc}")
+
+
+async def timeout_and_log(
+    message: discord.Message,
+    duration: timedelta,
+    reason: str,
+    *,
+    delete_message: bool = False,
+) -> bool:
+    deleted = False
+    if delete_message:
+        deleted = await safe_delete(message)
+
     until = discord.utils.utcnow() + duration
     try:
-        await member.timeout(until, reason=reason)
+        await message.author.timeout(until, reason=reason)
     except discord.Forbidden:
-        print(f"Missing permission to timeout {member}.")
+        print(f"Missing permission to timeout {message.author}.")
+        return False
     except discord.HTTPException as exc:
-        print(f"Failed to timeout {member}: {exc}")
+        print(f"Failed to timeout {message.author}: {exc}")
+        return False
+
+    await log_moderation_action(
+        message=message,
+        reason=reason,
+        duration=duration,
+        deleted=deleted,
+    )
+    return True
 
 
-async def safe_delete(message: discord.Message):
+async def safe_delete(message: discord.Message) -> bool:
     try:
         await message.delete()
+        return True
     except discord.Forbidden:
         print("Missing permission to delete messages.")
     except discord.HTTPException:
         pass
+    return False
 
 
 def build_rules_embed(guild: discord.Guild | None) -> discord.Embed:
@@ -166,13 +341,13 @@ def build_rules_embed(guild: discord.Guild | None) -> discord.Embed:
     )
 
     rules_text = (
-        "**1.** Do not spam or start problems in chat.\n"
+        "**1.** Do not spam or start problems in chat. Obvious spam flood is an auto 1 hour timeout.\n"
         "**2.** Do not use the stream ideas channel for anything other than stream ideas.\n"
-        "**3.** Do not ask for mod. You will be auto timed out.\n"
-        "**4.** Do not spam the same message over and over. Real repeated spam will be timed out.\n"
+        "**3.** Do not ask for mod twice. You will be auto timed out.\n"
+        "**4.** Real spam gets timed out. Normal conversation with different messages does not.\n"
         "**5.** Arguing will be dealt with manually. Keep it friendly.\n"
         f"**6.** Respect everyone fairly and equally. We are all here for the love of {streamer_mention} and his dumb streams.\n"
-        "**7.** No hate speech, slurs, or severe phrases like kys. That is an instant one week timeout.\n"
+        "**7.** No hate speech, slurs, TOS-breaking content, or severe phrases like kys. That is an instant one week timeout.\n"
         "**8.** No serious threats toward people in chat.\n"
     )
 
@@ -242,37 +417,42 @@ async def handle_exact_spam(message: discord.Message) -> bool:
 
     same_count = sum(1 for content, _ in user_queue if content == normalized)
     if same_count >= SPAM_REPEAT_COUNT:
-        await timeout_member(
-            message.author,
-            ONE_DAY,
+        return await timeout_and_log(
+            message,
+            ONE_HOUR,
             "Spam: repeated same message 5 times in 10 seconds",
+            delete_message=False,
         )
-        return True
 
     return False
 
 
-async def handle_word_spam(message: discord.Message) -> bool:
+async def handle_gibberish_flood(message: discord.Message) -> bool:
     now = discord.utils.utcnow()
-    tokens = tokenize(message.content)
+    normalized = normalize_text(message.content)
 
-    if not tokens:
+    if not normalized:
         return False
 
-    for token in tokens:
-        dq = recent_word_usage[message.author.id][token]
-        dq.append(now)
+    dq = recent_activity[message.author.id]
+    dq.append((normalized, now, looks_like_gibberish(message.content)))
 
-        while dq and (now - dq[0]).total_seconds() > SPAM_WINDOW_SECONDS:
-            dq.popleft()
+    while dq and (now - dq[0][1]).total_seconds() > SPAM_FLOOD_WINDOW_SECONDS:
+        dq.popleft()
 
-        if len(dq) >= SPAM_REPEAT_COUNT:
-            await timeout_member(
-                message.author,
-                ONE_DAY,
-                f"Spam: repeated word '{token}' 5 times in 10 seconds",
-            )
-            return True
+    if len(dq) < SPAM_FLOOD_COUNT:
+        return False
+
+    gibberish_count = sum(1 for _, _, flagged in dq if flagged)
+    distinct_count = len({content for content, _, _ in dq})
+
+    if gibberish_count >= 4 and distinct_count >= 4:
+        return await timeout_and_log(
+            message,
+            ONE_HOUR,
+            "Spam: obvious gibberish flood across 5 messages",
+            delete_message=False,
+        )
 
     return False
 
@@ -289,12 +469,12 @@ async def handle_mod_begging(message: discord.Message) -> bool:
         dq.popleft()
 
     if len(dq) >= MOD_BEG_REPEAT_COUNT:
-        await timeout_member(
-            message.author,
+        return await timeout_and_log(
+            message,
             ONE_DAY,
             "Asked for mod twice within 10 minutes",
+            delete_message=False,
         )
-        return True
 
     return False
 
@@ -303,26 +483,32 @@ async def handle_severe_content(message: discord.Message) -> bool:
     text = message.content
 
     if contains_banned_terms(text, HATE_SPEECH_TERMS):
-        await safe_delete(message)
-        await timeout_member(
-            message.author,
+        return await timeout_and_log(
+            message,
             ONE_WEEK,
             "Used slurs / hate speech",
+            delete_message=True,
         )
-        return True
+
+    if TOS_TERMS and contains_banned_terms(text, TOS_TERMS):
+        return await timeout_and_log(
+            message,
+            ONE_WEEK,
+            "Used TOS-breaking term",
+            delete_message=True,
+        )
 
     return False
 
 
 async def handle_severe_threats(message: discord.Message) -> bool:
     if matches_any_pattern(message.content, SEVERE_THREAT_PATTERNS):
-        await safe_delete(message)
-        await timeout_member(
-            message.author,
+        return await timeout_and_log(
+            message,
             ONE_WEEK,
             "Severe threats / harassment",
+            delete_message=True,
         )
-        return True
 
     return False
 
@@ -353,6 +539,8 @@ async def on_message(message: discord.Message):
     if await handle_exact_spam(message):
         return
 
+    if await handle_gibberish_flood(message):
+        return
 
     await bot.process_commands(message)
 
