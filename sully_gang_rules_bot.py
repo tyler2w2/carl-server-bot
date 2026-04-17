@@ -88,7 +88,6 @@ SEVERE_THREAT_PATTERNS = [
 # =========================
 recent_messages = defaultdict(deque)
 recent_mod_begs = defaultdict(deque)
-recent_word_usage = defaultdict(lambda: defaultdict(deque))
 rules_message_id = RULES_MESSAGE_ID
 
 # =========================
@@ -124,10 +123,6 @@ def normalize_text(text: str) -> str:
     text = text.lower().strip()
     text = re.sub(r"\s+", " ", text)
     return text
-
-
-def tokenize(text: str) -> list[str]:
-    return re.findall(r"[a-zA-Z0-9']+", text.lower())
 
 
 def contains_banned_terms(text: str, terms: set[str]) -> bool:
@@ -174,7 +169,7 @@ def build_rules_embed(guild: discord.Guild | None) -> discord.Embed:
         "**1.** Do not spam or start problems in chat.\n"
         "**2.** Do not use the stream ideas channel for anything other than stream ideas.\n"
         "**3.** Do not ask for mod. You will be auto timed out.\n"
-        "**4.** Do not spam the same message 5 times. You will be timed out.\n"
+        "**4.** Do not spam the same message over and over. Real repeated spam will be timed out.\n"
         "**5.** Arguing will be dealt with manually. Keep it friendly.\n"
         f"**6.** Respect everyone fairly and equally. We are all here for the love of {streamer_mention} and his dumb streams.\n"
         "**7.** No hate speech, slurs, or severe phrases like kys. That is an instant one week timeout.\n"
@@ -358,8 +353,6 @@ async def on_message(message: discord.Message):
     if await handle_exact_spam(message):
         return
 
-    if await handle_word_spam(message):
-        return
 
     await bot.process_commands(message)
 
