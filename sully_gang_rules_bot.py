@@ -49,6 +49,8 @@ SPAM_FLOOD_COUNT = 5
 MOD_BEG_WINDOW_SECONDS = 600
 MOD_BEG_REPEAT_COUNT = 2
 MAX_LOG_CONTENT_LENGTH = 1000
+MAX_HISTORY_MESSAGES = 10
+MAX_HISTORY_FIELD_LENGTH = 1024
 
 # =========================
 # MODERATION SETTINGS
@@ -111,6 +113,7 @@ COMMON_CHAT_WORDS = {
 recent_messages = defaultdict(deque)
 recent_mod_begs = defaultdict(deque)
 recent_activity = defaultdict(deque)
+user_message_history = defaultdict(lambda: deque(maxlen=MAX_HISTORY_MESSAGES))
 rules_message_id = RULES_MESSAGE_ID
 
 # =========================
@@ -177,19 +180,25 @@ def looks_like_gibberish(text: str) -> bool:
     if not normalized:
         return False
 
+    if normalized.startswith(("http://", "https://")):
+        return False
+
     letters_only = re.sub(r"[^a-z]", "", normalized)
     if len(letters_only) < 6:
         return False
 
     tokens = tokenize(normalized)
-    long_tokens = [tok for tok in tokens if len(tok) >= 4]
-    if not long_tokens:
+    if not tokens:
         return False
 
     known_words = sum(1 for tok in tokens if tok in COMMON_CHAT_WORDS)
-    vowel_ratio = sum(1 for ch in letters_only if ch in "aeiou") / max(len(letters_only), 1)
-    consonant_runs = re.findall(r"[bcdfghjklmnpqrstvwxyz]{5,}", letters_only)
     weird_chars = re.findall(r"[^\w\s]", text)
+    vowel_ratio = sum(1 for ch in letters_only if ch in "aeiou") / max(len(letters_only), 1)
+    unique_chars = len(set(letters_only)) / max(len(letters_only), 1)
+    consonant_runs = re.findall(r"[bcdfghjklmnpqrstvwxyz]{4,}", letters_only)
+
+    single_token_message = len(tokens) == 1 and len(tokens[0]) >= 7
+    mostly_single_blob = len(tokens) <= 2 and max(len(tok) for tok in tokens) >= 7
 
     if known_words >= 2:
         return False
@@ -197,18 +206,59 @@ def looks_like_gibberish(text: str) -> bool:
     if consonant_runs:
         return True
 
-    if vowel_ratio < 0.22 and len(letters_only) >= 8:
+    if len(weird_chars) >= 1 and mostly_single_blob and known_words == 0:
         return True
 
-    if len(weird_chars) >= 2 and known_words == 0 and len(letters_only) >= 8:
+    if single_token_message and known_words == 0 and unique_chars >= 0.5:
         return True
 
-    if len(long_tokens) >= 1 and all(tok not in COMMON_CHAT_WORDS for tok in long_tokens) and len(tokens) <= 3:
-        unique_chars = len(set(letters_only)) / max(len(letters_only), 1)
-        if unique_chars > 0.55 and vowel_ratio < 0.3:
-            return True
+    if mostly_single_blob and known_words == 0 and unique_chars >= 0.6 and 0.2 <= vowel_ratio <= 0.55:
+        return True
 
     return False
+
+
+def record_user_message(message: discord.Message):
+    attachment_note = ""
+    if message.attachments:
+        attachment_note = f" [attachments: {len(message.attachments)}]"
+
+    content = message.content.strip() or "(no text)"
+    user_message_history[message.author.id].append({
+        "timestamp": message.created_at,
+        "content": f"{content}{attachment_note}",
+    })
+
+
+def build_recent_history_text(user_id: int) -> str:
+    history = user_message_history.get(user_id)
+    if not history:
+        return "No recent history."
+
+    lines = []
+    total_length = 0
+
+    for entry in history:
+        timestamp = entry["timestamp"]
+        if isinstance(timestamp, datetime):
+            timestamp_text = timestamp.strftime("%Y-%m-%d %H:%M:%S UTC")
+        else:
+            timestamp_text = str(timestamp)
+
+        content = truncate_text(entry["content"], 140)
+        line = f"[{timestamp_text}] {content}"
+        projected = total_length + len(line) + 1
+
+        if projected > MAX_HISTORY_FIELD_LENGTH:
+            remaining = MAX_HISTORY_FIELD_LENGTH - total_length - 4
+            if remaining > 0:
+                lines.append(line[:remaining] + "...")
+            break
+
+        lines.append(line)
+        total_length = projected
+
+    return "\n".join(lines) if lines else "No recent history."
 
 
 async def get_mod_log_channel(guild: discord.Guild | None):
@@ -269,6 +319,11 @@ async def log_moderation_action(
     embed.add_field(name="Channel", value=message.channel.mention, inline=True)
     embed.add_field(name="When", value=f"<t:{int(discord.utils.utcnow().timestamp())}:F>", inline=False)
     embed.add_field(name="Message Content", value=truncate_text(message.content), inline=False)
+    embed.add_field(
+        name="Last 10 Messages",
+        value=build_recent_history_text(message.author.id),
+        inline=False,
+    )
 
     if message.attachments:
         attachment_lines = [attachment.url for attachment in message.attachments[:5]]
@@ -446,7 +501,13 @@ async def handle_gibberish_flood(message: discord.Message) -> bool:
     gibberish_count = sum(1 for _, _, flagged in dq if flagged)
     distinct_count = len({content for content, _, _ in dq})
 
-    if gibberish_count >= 4 and distinct_count >= 4:
+    suspicious_single_blob_count = sum(
+        1
+        for content, _, _ in dq
+        if len(tokenize(content)) <= 2 and len(re.sub(r"[^a-z]", "", content)) >= 6
+    )
+
+    if gibberish_count >= 4 and distinct_count >= 4 and suspicious_single_blob_count >= 4:
         return await timeout_and_log(
             message,
             ONE_HOUR,
@@ -526,6 +587,8 @@ async def on_ready():
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
+
+    record_user_message(message)
 
     if await handle_severe_content(message):
         return
